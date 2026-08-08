@@ -24,12 +24,13 @@ app.get('/', (req, res) => {
   res.json({ message: 'NGO Backend is running!' });
 });
 
+// ==================== PAYMENT ROUTES ====================
+
 // Create Order
 app.post('/api/create-order', async (req, res) => {
   try {
     const { amount, currency = 'INR', receipt, notes = {} } = req.body;
 
-    // Validate
     if (!amount || amount <= 0) {
       return res.status(400).json({
         success: false,
@@ -38,14 +39,14 @@ app.post('/api/create-order', async (req, res) => {
     }
 
     const options = {
-      amount: amount * 100, // Convert to paise (1 INR = 100 paise)
+      amount: amount * 100,
       currency: currency,
       receipt: receipt || `receipt_${Date.now()}`,
       notes: {
         ...notes,
         timestamp: new Date().toISOString()
       },
-      payment_capture: 1 // Auto-capture payment
+      payment_capture: 1
     };
 
     const order = await razorpay.orders.create(options);
@@ -73,7 +74,6 @@ app.post('/api/verify-payment', async (req, res) => {
   try {
     const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
 
-    // Validate
     if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
       return res.status(400).json({
         success: false,
@@ -81,7 +81,6 @@ app.post('/api/verify-payment', async (req, res) => {
       });
     }
 
-    // Generate expected signature
     const secret = process.env.RAZORPAY_KEY_SECRET;
     const body = razorpay_order_id + "|" + razorpay_payment_id;
     const expectedSignature = crypto
@@ -89,9 +88,7 @@ app.post('/api/verify-payment', async (req, res) => {
       .update(body)
       .digest('hex');
 
-    // Compare signatures
     if (expectedSignature === razorpay_signature) {
-      // Payment verified - You can update database here
       res.json({
         success: true,
         message: 'Payment verified successfully',
@@ -115,7 +112,7 @@ app.post('/api/verify-payment', async (req, res) => {
   }
 });
 
-// Get Payment Details (Optional)
+// Get Payment Details
 app.get('/api/payment/:paymentId', async (req, res) => {
   try {
     const { paymentId } = req.params;
@@ -136,9 +133,225 @@ app.get('/api/payment/:paymentId', async (req, res) => {
   }
 });
 
-// Start Server
+// ==================== PAYOUT ROUTES ====================
+
+// Create Fund Account for Member
+app.post('/api/create-fund-account', async (req, res) => {
+  try {
+    const { memberId, name, ifsc, accountNumber } = req.body;
+
+    console.log('💰 Creating fund account for:', { memberId, name });
+
+    if (!memberId || !name || !ifsc || !accountNumber) {
+      return res.status(400).json({
+        success: false,
+        message: 'Missing required fields'
+      });
+    }
+
+    const fundAccount = await razorpay.fundAccounts.create({
+      customer_id: `customer_${memberId}`,
+      account_type: 'bank_account',
+      bank_account: {
+        name: name,
+        ifsc: ifsc,
+        account_number: accountNumber
+      }
+    });
+
+    console.log('✅ Fund account created:', fundAccount.id);
+
+    res.json({
+      success: true,
+      fundAccountId: fundAccount.id,
+      fundAccount: fundAccount
+    });
+
+  } catch (error) {
+    console.error('Fund account creation error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to create fund account',
+      error: error.message
+    });
+  }
+});
+
+// Process Payout (Send money to member's bank account)
+app.post('/api/process-payout', async (req, res) => {
+  try {
+    const { 
+      memberId, 
+      amount, 
+      bankAccount, 
+      memberName, 
+      memberEmail,
+      type,
+      description 
+    } = req.body;
+
+    console.log('💰 Processing payout request:', { memberId, amount, type });
+
+    // Validate
+    if (!amount || amount <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid amount'
+      });
+    }
+
+    if (!bankAccount || !bankAccount.accountNumber || !bankAccount.ifsc) {
+      return res.status(400).json({
+        success: false,
+        message: 'Bank account details required'
+      });
+    }
+
+    // Check if Razorpay account number is configured
+    if (!process.env.RAZORPAY_ACCOUNT_NUMBER) {
+      console.error('❌ RAZORPAY_ACCOUNT_NUMBER not configured in .env');
+      return res.status(500).json({
+        success: false,
+        message: 'Razorpay payout account not configured'
+      });
+    }
+
+    // Check if fund account exists, if not create one
+    let fundAccountId = bankAccount.fundAccountId;
+
+    if (!fundAccountId) {
+      try {
+        console.log('🔄 Creating fund account for member:', memberId);
+        
+        const fundAccount = await razorpay.fundAccounts.create({
+          customer_id: `customer_${memberId}`,
+          account_type: 'bank_account',
+          bank_account: {
+            name: memberName || 'Member',
+            ifsc: bankAccount.ifsc,
+            account_number: bankAccount.accountNumber
+          }
+        });
+        fundAccountId = fundAccount.id;
+        console.log('✅ Fund account created:', fundAccountId);
+      } catch (fundError) {
+        console.error('❌ Fund account creation failed:', fundError);
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to create fund account: ' + fundError.message
+        });
+      }
+    }
+
+    // Create payout
+    try {
+      console.log('🔄 Creating payout...');
+      
+      const payout = await razorpay.payouts.create({
+        account_number: process.env.RAZORPAY_ACCOUNT_NUMBER,
+        fund_account_id: fundAccountId,
+        amount: Math.round(amount * 100), // Convert to paise
+        currency: 'INR',
+        mode: 'IMPS',
+        purpose: type === 'commission' ? 'commission' : 'payout',
+        reference_id: `payout_${Date.now()}_${memberId.slice(0, 8)}`,
+        narration: description || `Payout to ${memberName || 'Member'}`
+      });
+
+      console.log('✅ Payout created:', payout.id);
+
+      res.json({
+        success: true,
+        payoutId: payout.id,
+        razorpayPayoutId: payout.id,
+        fundAccountId: fundAccountId,
+        amount: amount,
+        status: payout.status,
+        payout: payout
+      });
+
+    } catch (payoutError) {
+      console.error('❌ Payout creation failed:', payoutError);
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to create payout: ' + payoutError.message,
+        error: payoutError.message
+      });
+    }
+
+  } catch (error) {
+    console.error('❌ Payout error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to process payout',
+      error: error.message
+    });
+  }
+});
+
+// Get Payout Status
+app.get('/api/payout/:payoutId', async (req, res) => {
+  try {
+    const { payoutId } = req.params;
+    const payout = await razorpay.payouts.fetch(payoutId);
+    
+    res.json({
+      success: true,
+      payout
+    });
+
+  } catch (error) {
+    console.error('Error fetching payout:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch payout',
+      error: error.message
+    });
+  }
+});
+
+// Get Fund Account
+app.get('/api/fund-account/:memberId', async (req, res) => {
+  try {
+    const { memberId } = req.params;
+    // Note: Razorpay doesn't have a direct API to fetch fund account by customer_id
+    // You may need to store fundAccountId in your database
+    res.json({
+      success: false,
+      message: 'Please check fund account ID in database'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Payout Webhook (Optional - for real-time status updates)
+app.post('/api/payout-webhook', async (req, res) => {
+  try {
+    const { payload } = req.body;
+    
+    if (payload && payload.payout) {
+      const payout = payload.payout.entity;
+      console.log('📢 Payout webhook received:', payout.id, payout.status);
+      
+      // You can update your database with payout status here
+    }
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Webhook error:', error);
+    res.status(500).json({ success: false });
+  }
+});
+
+// ==================== START SERVER ====================
+
 app.listen(PORT, () => {
   console.log(`🚀 Backend running on http://localhost:${PORT}`);
   console.log(`📝 Environment: ${process.env.NODE_ENV || 'development'}`);
   console.log(`💳 Razorpay Key: ${process.env.RAZORPAY_KEY_ID ? '✓ Configured' : '✗ Missing'}`);
+  console.log(`💰 Payout Account: ${process.env.RAZORPAY_ACCOUNT_NUMBER ? '✓ Configured' : '✗ Missing'}`);
 });
