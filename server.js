@@ -336,7 +336,6 @@ app.post('/api/payout-webhook', async (req, res) => {
     if (payload && payload.payout) {
       const payout = payload.payout.entity;
       console.log('📢 Payout webhook received:', payout.id, payout.status);
-      
       // You can update your database with payout status here
     }
     
